@@ -17,7 +17,11 @@ from django.contrib import admin
 from django.urls import path
 from django.conf.urls import include, url
 
+
+from opencv_webapp import views
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     url(r'', include('opencv_webapp.urls')),
+    path('face_detection/detect/',views.requested_url),
 ]

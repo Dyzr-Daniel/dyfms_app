@@ -1,96 +1,113 @@
-from django.shortcuts import render
+#from django.shortcuts import render
 
 ### Initializing the imports
 import numpy as np
-import urllib
 import cv2
-from django.views.decorators.csrf import csrf_exempt
-from django.http import JsonResponse
-from django.conf import settings
 
 
-### for first view
-def first_view(request):
-    return render(request, 'opencv_webapp/first_view.html', {})
 
 
-# define the path to the face detector which would be an xml file that comes installed with haarcascades
-# find it here -> https://github.com/opencv/opencv/tree/master/data/haarcascades
-# download and save it in your project repository
-# define the face detector now
+class CoverDescriptor:
+    def __init__(self, useSIFT=False):
+        # store whether or not SIFT should be used as the feature
+        # detector and extractor
+        self.useSIFT = useSIFT
 
-baseUrl = settings.MEDIA_ROOT_URL + settings.MEDIA_URL
-face_detector = baseUrl + 'haarcascade_frontalface_default.xml'
+    def describe(self, image):
+        # initialize the BRISK detector and feature extractor (the
+        # standard OpenCV 3 install includes BRISK by default)
+        descriptor = cv2.BRISK_create()
 
-# start off with defining a function to detect the URL requested which has the image for facial recognition
-@csrf_exempt
+        # check if SIFT should be utilized to detect and extract
+        # features (this this will cause an error if you are using
+        # OpenCV 3.0+ and do not have the `opencv_contrib` module
+        # installed and use the `xfeatures2d` package)
+        if self.useSIFT:
+            descriptor = cv2.xfeatures2d.SIFT_create()
 
-def requested_url(request):
-    #default value set to be false
+        # detect keypoints in the image, describing the region
+        # surrounding each keypoint, then convert the keypoints
+        # to a NumPy array
+        (kps, descs) = descriptor.detectAndCompute(image, None)
+        kps = np.float32([kp.pt for kp in kps])
 
-    default = {"safely executed": False} #because no detection yet
-
-    ## between GET or POST, we go with Post request and check for https
-
-    if request.method == "POST":
-        if request.FILES.get("image", None) is not None:
-
-            image_to_read = read_image(stream = request.FILES["image"])
-
-
-        else: # URL is provided by the user
-            url_provided = request.POST.get("url", None)
-
-
-            if url_provided is None:
-                default["error_value"] = "There is no URL Provided"
-
-                return JsonResponse(default)
-
-            image_to_read = read_image(url = url_provided)
+        # return a tuple of keypoints and descriptors
+        return (kps, descs)
 
 
-        image_to_read = cv2.cvtColor(image_to_read, cv2.COLOR_BGR2GRAY)
+class CoverMatcher:
+    def __init__(self, descriptor, coverPaths, ratio=0.7, minMatches=40,
+                 useHamming=True):
+        # store the descriptor, book cover paths, ratio and minimum
+        # number of matches for the homography calculation, then
+        # initialize the distance metric to be used when computing
+        # the distance between features
+        self.descriptor = descriptor
+        self.coverPaths = coverPaths
+        self.ratio = ratio
+        self.minMatches = minMatches
+        self.distanceMethod = "BruteForce"
 
-        detector_value = cv2.CascadeClassifier(face_detector)
-        #passing the face detector path
-        # make sure to pass the complete path to the .xml file
-        values = detector_value.detectMultiScale(image_to_read,
-                                                 scaleFactor=1.1,
-                                                 minNeighbors = 5,
-                                                 minSize=(30,30),
-                                                 flags = cv2.CASCADE_SCALE_IMAGE)
+        # if the Hamming distance should be used, then update the
+        # distance method
+        if useHamming:
+            self.distanceMethod += "-Hamming"
 
-        ###dimensions for boxes that will pop up around the face
-        values=[(int(a), int(b), int(a+c), int(b+d)) for (a,b,c,d) in values]
+    def search(self, queryKps, queryDescs):
+        # initialize the dictionary of results
+        results = {}
 
-        default.update({"#of_faces": len(values),
-                        "faces":values,
-                        "safely_executed": True })
+        # loop over the book cover images
+        for coverPath in self.coverPaths:
+            # load the query image, convert it to grayscale, and
+            # extract keypoints and descriptors
+            cover = cv2.imread(coverPath)
+            gray = cv2.cvtColor(cover, cv2.COLOR_BGR2GRAY)
+            (kps, descs) = self.descriptor.describe(gray)
 
-    return JsonResponse(default)
+            # determine the number of matched, inlier keypoints,
+            # then update the results
+            score = self.match(queryKps, queryDescs, kps, descs)
 
-def read_image(path=None, stream=None, url=None):
+            results[coverPath] = score
 
-    ##### primarily URL but if the path is None
-    ## load the image from your local repository
+        # if matches were found, sort them
+        if len(results) > 0:
+            results = sorted([(v, k) for (k, v) in results.items() if v > 0],
+                             reverse=True)
 
-    if path is not None:
-        image = cv2.imread(path)
+        # return the results
+        return results
 
-    else:
-        if url is not None:
+    def match(self, kpsA, featuresA, kpsB, featuresB):
+        # compute the raw matches and initialize the list of actual
+        # matches
+        matcher = cv2.DescriptorMatcher_create(self.distanceMethod)
+        rawMatches = matcher.knnMatch(featuresB, featuresA, 2)
+        matches = []
 
-            response = urllib.request.urlopen(url)
+        # loop over the raw matches
+        for m in rawMatches:
+            # ensure the distance is within a certain ratio of each
+            # other
+            if len(m) == 2 and m[0].distance < m[1].distance * self.ratio:
+                matches.append((m[0].trainIdx, m[0].queryIdx))
 
-            data_temp = response.read()
+        # check to see if there are enough matches to process
+        if len(matches) > self.minMatches:
+            # construct the two sets of points
+            ptsA = np.float32([kpsA[i] for (i, _) in matches])
+            ptsB = np.float32([kpsB[j] for (_, j) in matches])
 
-        elif stream is not None:
-            # implying image is now streaming
-            data_temp = stream.read()
+            # compute the homography between the two sets of points
+            # and compute the ratio of matched points
+            (_, status) = cv2.findHomography(ptsA, ptsB, cv2.RANSAC, 4.0)
 
-        image = np.asarray(bytearray(data_temp), dtype="uint8")
+            # return the ratio of the number of matched keypoints
+            # to the total number of keypoints
+            return float(status.sum()) / status.size
 
-        image = cv2.imdecode(image, cv2.IMREAD_COLOR)
+        # no matches were found
+        return -1.0
 
-    return image
+
